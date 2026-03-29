@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pykrx
+pandas
+numpy
+requests
+setuptools
