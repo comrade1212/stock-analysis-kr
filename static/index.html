@@ -84,8 +84,15 @@
   <!-- ① 수급분석표 -->
   <div id="tab-supply">
     <div class="card mb-4">
-      <h3 class="font-bold text-white mb-4 text-lg">세력별 수급 성적표</h3>
-      <div class="text-xs text-slate-400 mb-3">분산비율: 0%=매집시작 → 100%=완전매집 → 하락=분산(매도 중)</div>
+      <div class="flex flex-wrap items-center justify-between mb-3 gap-2">
+        <h3 class="font-bold text-white text-lg">세력별 수급 성적표</h3>
+        <span id="invColsLabel" class="text-xs text-slate-400"></span>
+      </div>
+      <div class="flex flex-wrap gap-4 text-xs text-slate-400 mb-3">
+        <span>📌 매집고점: 누적순매수 최고치</span>
+        <span>📌 분산비율: 0%=매집시작 → 100%=완전매집 → 하락=분산(매도)</span>
+        <span>📌 주가선도비중: 양(+) 보유 투자주체 중 비율</span>
+      </div>
       <div class="overflow-x-auto">
         <table>
           <thead>
@@ -94,9 +101,9 @@
               <th>매집고점(주)</th>
               <th>현재보유(주)</th>
               <th>분산비율</th>
-              <th>평균단가</th>
+              <th>평균단가(원)</th>
               <th>주가선도비중</th>
-              <th style="min-width:120px">진행도</th>
+              <th style="min-width:120px">분산진행도</th>
             </tr>
           </thead>
           <tbody id="supplyBody"></tbody>
@@ -104,7 +111,7 @@
       </div>
     </div>
     <div class="card">
-      <h3 class="font-bold text-white mb-3">최근 10영업일 투자주체별 순매수 (원)</h3>
+      <h3 class="font-bold text-white mb-3">최근 20영업일 투자주체별 순매수</h3>
       <div class="overflow-x-auto" id="recent10"></div>
     </div>
   </div>
@@ -232,14 +239,17 @@ function renderAll() {
 // ① 수급분석표
 function renderSupplyTable() {
   const s = SD.supply_summary, cols = SD.inv_cols;
+  const label = document.getElementById('invColsLabel');
   if (!cols || !cols.length) {
     document.getElementById('supplyBody').innerHTML =
       `<tr><td colspan="7" class="text-center text-slate-400 py-8">
-        ⚠️ 이 PC에서는 외국인 데이터만 표시됩니다.<br>
-        Render.com 배포 후 개인·기관·투신·은행·보험·연기금·사모펀드 전체 데이터가 활성화됩니다.
+        ⚠️ 수급 데이터를 가져올 수 없습니다.<br>
+        잠시 후 다시 시도하거나 Render.com 배포 서버에서 확인하세요.
       </td></tr>`;
+    if (label) label.textContent = '';
     return;
   }
+  if (label) label.textContent = `투자주체 ${cols.length}개: ${cols.join(' · ')}`;
   // 주가선도비중 내림차순 정렬
   const sorted = [...cols].sort((a,b) => (s[b]?.leadership_pct??0)-(s[a]?.leadership_pct??0));
   let html = '';
@@ -249,24 +259,31 @@ function renderSupplyTable() {
     const ci = cols.indexOf(col);
     const color = COLORS[ci % COLORS.length];
     const barColor = dr >= 80 ? '#f87171' : dr >= 50 ? '#fbbf24' : '#34d399';
+    const holdCls = (v.current_hold||0) > 0 ? 'pos' : (v.current_hold||0) < 0 ? 'neg' : '';
     html += `<tr>
-      <td><span style="color:${color};margin-right:4px">●</span>${col}</td>
+      <td><span style="color:${color};margin-right:6px;font-size:1.1em">●</span><b>${col}</b></td>
       <td>${fQ(v.peak_accum)}</td>
-      <td class="${(v.current_hold||0)>0?'pos':(v.current_hold||0)<0?'neg':''}">${fQ(v.current_hold)}</td>
-      <td><b style="color:${barColor}">${dr}%</b></td>
-      <td>${v.avg_price ? fN(v.avg_price)+'원' : '-'}</td>
-      <td><b class="text-yellow-400">${v.leadership_pct??0}%</b></td>
-      <td><div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(dr,100)}%;background:${barColor}"></div></div></td>
+      <td class="${holdCls}">${fQ(v.current_hold)}</td>
+      <td>
+        <b style="color:${barColor};font-size:1.05em">${dr}%</b>
+        <div class="bar-wrap" style="margin-top:3px"><div class="bar-fill" style="width:${Math.min(dr,100)}%;background:${barColor}"></div></div>
+      </td>
+      <td>${v.avg_price ? fN(v.avg_price) : '-'}</td>
+      <td><b style="color:#facc15;font-size:1.05em">${v.leadership_pct??0}%</b></td>
+      <td>
+        <div style="font-size:.75rem;color:#64748b">${dr<30?'매집중':dr<70?'진행중':dr<90?'고점근접':'분산중'}</div>
+        <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(dr,100)}%;background:${barColor}"></div></div>
+      </td>
     </tr>`;
   });
   document.getElementById('supplyBody').innerHTML = html;
 }
 
-// 최근 10일
+// 최근 20일
 function renderRecent10() {
   const cols = SD.inv_cols;
   if (!cols || !cols.length) return;
-  const rows = SD.data.slice(-10).reverse();
+  const rows = SD.data.slice(-20).reverse();
   let h = '<table><thead><tr><th style="text-align:left">날짜</th><th>종가</th>';
   cols.forEach(c => h += `<th>${c}</th>`);
   h += '</tr></thead><tbody>';

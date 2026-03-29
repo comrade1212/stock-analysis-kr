@@ -129,22 +129,29 @@ def naver_frgn_data(ticker: str, max_pages: int = 20) -> pd.DataFrame:
 
 
 def fetch_investor_data(ticker: str, today: str):
-    """KRX 상세(전체투자자) → KRX 기본 → Naver 외국인 순으로 시도"""
-    # 1순위: KRX 상세 (개인/외국인/기관/투신/은행/보험/연기금/사모펀드 등 전체)
+    """KRX 상세(전체투자자) → KRX 기본 → Naver 외국인 순으로 시도 (주수 기반)"""
+    # 1순위: KRX 상세 거래량 (개인/외국인/기관계/금융투자/보험/투신/기타금융/은행/연기금등/사모펀드/기타법인/내외국인)
+    try:
+        df = stock.get_market_trading_volume_by_date("19900101", today, ticker, detail=True)
+        if not df.empty:
+            return df, [c for c in df.columns if c != "전체"]
+    except Exception:
+        pass
+    # 2순위: KRX 기본 거래량 (개인/외국인/기관계/기타법인)
+    try:
+        df = stock.get_market_trading_volume_by_date("19900101", today, ticker)
+        if not df.empty:
+            return df, [c for c in df.columns if c != "전체"]
+    except Exception:
+        pass
+    # 3순위: KRX 상세 거래대금 fallback
     try:
         df = stock.get_market_trading_value_by_date("19900101", today, ticker, detail=True)
         if not df.empty:
             return df, [c for c in df.columns if c != "전체"]
     except Exception:
         pass
-    # 2순위: KRX 기본 (외국인/기관계/개인/기타법인)
-    try:
-        df = stock.get_market_trading_value_by_date("19900101", today, ticker)
-        if not df.empty:
-            return df, [c for c in df.columns if c != "전체"]
-    except Exception:
-        pass
-    # 3순위: Naver 외국인 only
+    # 4순위: Naver 외국인 only
     df = naver_frgn_data(ticker)
     return df, list(df.columns) if not df.empty else []
 
