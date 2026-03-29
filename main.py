@@ -13,7 +13,6 @@ import urllib.request
 import urllib.parse
 import json
 import re
-import requests as req_lib
 
 ticker_cache: dict = {}
 cache_ready = False
@@ -93,74 +92,56 @@ def krx_search_by_code(code: str) -> list:
     return results
 
 
-def naver_frgn_data(ticker: str, max_pages: int = 20) -> pd.DataFrame:
-    """Naver 외국인 순매수 (KRX 차단 시 fallback)"""
-    all_rows = []
-    for page in range(1, max_pages + 1):
-        try:
-            r = req_lib.get(
-                f"http://finance.naver.com/item/frgn.naver?code={ticker}&page={page}",
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "http://finance.naver.com/"},
-                timeout=8)
-            tables = re.findall(r'<table[^>]*>.*?</table>', r.text, re.DOTALL)
-            found = False
-            for t in tables:
-                rows = re.findall(r'<tr[^>]*>.*?</tr>', t, re.DOTALL)
-                for row in rows:
-                    tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-                    vals = [re.sub(r'<[^>]+>', '', td).strip().replace('\xa0', '').replace('\n', '').replace('\t', '') for td in tds]
-                    vals = [v for v in vals if v]
-                    if vals and re.match(r'\d{4}\.\d{2}\.\d{2}', vals[0]):
-                        try:
-                            net_buy = int(vals[5].replace(',', '').replace('+', '')) if len(vals) > 5 else 0
-                            all_rows.append({"date": vals[0].replace('.', '-'), "외국인": net_buy})
-                            found = True
-                        except Exception:
-                            pass
-            if not found:
-                break
-        except Exception:
-            break
-    if not all_rows:
+def fetch_ohlcv_naver(ticker: str, today: str) -> pd.DataFrame:
+    """Naver 차트 API: 상장일~현재 OHLCV 한 번에 (빠름, 완전 역사 데이터)"""
+    url = (
+        f"https://fchart.stock.naver.com/siseJson.nhn"
+        f"?symbol={ticker}&requestType=1"
+        f"&startTime=19900101&endTime={today}&timeframe=day"
+    )
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read().decode("utf-8")
+
+    rows = re.findall(
+        r'\["(\d{8})",\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)', raw)
+    if not rows:
         return pd.DataFrame()
-    df = pd.DataFrame(all_rows)
+
+    df = pd.DataFrame(rows, columns=["date", "시가", "고가", "저가", "종가", "거래량"])
     df["date"] = pd.to_datetime(df["date"])
-    return df.sort_values("date").set_index("date")
+    for col in ["시가", "고가", "저가", "종가", "거래량"]:
+        df[col] = pd.to_numeric(df[col])
+    return df.set_index("date").sort_index()
 
 
 def fetch_investor_data(ticker: str, today: str):
-    """KRX 상세(전체투자자) → KRX 기본 → Naver 외국인 순으로 시도 (주수 기반)"""
-    # 1순위: KRX 상세 거래량 (개인/외국인/기관계/금융투자/보험/투신/기타금융/은행/연기금등/사모펀드/기타법인/내외국인)
-    try:
-        df = stock.get_market_trading_volume_by_date("19900101", today, ticker, detail=True)
-        if not df.empty:
-            return df, [c for c in df.columns if c != "전체"]
-    except Exception:
-        pass
-    # 2순위: KRX 기본 거래량 (개인/외국인/기관계/기타법인)
-    try:
-        df = stock.get_market_trading_volume_by_date("19900101", today, ticker)
-        if not df.empty:
-            return df, [c for c in df.columns if c != "전체"]
-    except Exception:
-        pass
-    # 3순위: KRX 상세 거래대금 fallback
+    """KRX 투자자별 거래실적 (상세 → 기본 순서 시도)
+    반환 컬럼: 금융투자, 보험, 투신, 사모, 은행, 기타금융, 연기금, 기타법인, 개인, 외국인, 기타외국인
+    """
+    # 1순위: KRX 상세 (11개 투자주체)
     try:
         df = stock.get_market_trading_value_by_date("19900101", today, ticker, detail=True)
         if not df.empty:
             return df, [c for c in df.columns if c != "전체"]
     except Exception:
         pass
-    # 4순위: Naver 외국인 only
-    df = naver_frgn_data(ticker)
-    return df, list(df.columns) if not df.empty else []
+    # 2순위: KRX 기본 (개인/외국인/기관계/기타법인)
+    try:
+        df = stock.get_market_trading_value_by_date("19900101", today, ticker)
+        if not df.empty:
+            return df, [c for c in df.columns if c != "전체"]
+    except Exception:
+        pass
+    return pd.DataFrame(), []
 
 
 def calc_supply_analysis(df: pd.DataFrame, inv_cols: list):
     """
     투자주체별 수급 분석 계산
     - 매집고점: 누적순매수의 역대 최고값
-    - 현재보유수량: 현재 누적순매수
+    - 현재보유: 현재 누적순매수
     - 분산비율(%): 현재보유 / 매집고점 × 100
     - 평균단가: 순매수 기준 가중평균 매수가
     - 주가선도비중: 양의 보유량 기준 상대 비중
@@ -173,10 +154,8 @@ def calc_supply_analysis(df: pd.DataFrame, inv_cols: list):
         cum = daily.cumsum()
         peak = cum.cummax()
 
-        # 분산비율 시계열
         dist = (cum / peak.replace(0, np.nan) * 100).fillna(0).clip(0, 100)
 
-        # 평균단가 (매수분만 가중평균)
         buy_only = daily.clip(lower=0)
         total_buy = buy_only.sum()
         avg_p = float((df["종가"] * buy_only).sum() / total_buy) if total_buy > 0 else 0
@@ -189,7 +168,6 @@ def calc_supply_analysis(df: pd.DataFrame, inv_cols: list):
         }
         dist_series[col] = dist.round(1).tolist()
 
-    # 주가선도비중
     pos_total = sum(max(0, v["current_hold"]) for v in summary.values())
     for col in inv_cols:
         hold = max(0, summary[col]["current_hold"])
@@ -233,14 +211,17 @@ async def get_stock(ticker: str):
         except Exception:
             name = ticker_cache.get(ticker, {}).get("name", ticker)
 
-        # OHLCV (상장일~현재)
-        df_price = stock.get_market_ohlcv_by_date("19900101", today, ticker)
+        # OHLCV: Naver 차트 API (상장일~현재, 빠름)
+        df_price = fetch_ohlcv_naver(ticker, today)
+        if df_price is None or df_price.empty:
+            # fallback: pykrx
+            df_price = stock.get_market_ohlcv_by_date("19900101", today, ticker)
         if df_price is None or df_price.empty:
             raise ValueError(f"종목 데이터 없음: {ticker}")
 
         df_price["등락률"] = (df_price["종가"].pct_change() * 100).round(2)
 
-        # 수급 데이터 (전체 투자자)
+        # 수급 데이터
         df_inv, inv_cols = fetch_investor_data(ticker, today)
 
         if not df_inv.empty and inv_cols:
