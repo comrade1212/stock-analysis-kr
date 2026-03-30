@@ -3,6 +3,7 @@ uvicorn[standard]
 pykrx
 pandas
 numpy
+pyarrow
 requests
 setuptools
 finance-datareader

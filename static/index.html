@@ -63,13 +63,31 @@
       <span id="sName" class="text-2xl font-bold text-white"></span>
       <span id="sTicker" class="ml-2 text-slate-400 text-sm"></span>
       <span id="sMarket" class="ml-2 text-xs px-2 py-0.5 rounded font-bold"></span>
+      <span id="sCacheTag" class="ml-2 text-xs px-2 py-0.5 rounded hidden" style="background:#064e3b;color:#6ee7b7">💾 로컬캐시</span>
     </div>
-    <div class="ml-auto flex flex-wrap gap-8 text-right">
+    <div class="ml-auto flex flex-wrap gap-6 items-center text-right">
       <div><div class="text-xs text-slate-500">현재가</div><div id="sPrice" class="text-xl font-bold text-white"></div></div>
       <div><div class="text-xs text-slate-500">등락률</div><div id="sChange" class="text-xl font-bold"></div></div>
       <div><div class="text-xs text-slate-500">거래량</div><div id="sVol" class="text-lg font-semibold text-white"></div></div>
       <div><div class="text-xs text-slate-500">데이터 기간</div><div id="sPeriod" class="text-sm text-slate-300"></div></div>
+      <button id="dlBtn" onclick="startDownload()"
+        class="px-4 py-2 rounded-lg text-sm font-bold transition-all"
+        style="background:#1d4ed8;color:#fff;border:none;cursor:pointer">
+        ⬇ 전체 이력 다운로드
+      </button>
     </div>
+  </div>
+
+  <!-- 다운로드 진행 패널 -->
+  <div id="dlPanel" class="hidden card mb-4" style="border-color:#1d4ed8">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="font-bold text-blue-300">📥 전체 이력 다운로드</h3>
+      <span id="dlPct" class="text-blue-400 font-bold text-sm"></span>
+    </div>
+    <div class="bar-wrap mb-3" style="height:8px;background:#1e3a5f">
+      <div id="dlBar" class="bar-fill" style="width:0%;background:#3b82f6;height:8px"></div>
+    </div>
+    <div id="dlLog" class="text-sm text-slate-400 space-y-1 max-h-40 overflow-y-auto"></div>
   </div>
 
   <!-- 탭 -->
@@ -212,13 +230,14 @@ async function loadStock(ticker) {
 
 function renderAll() {
   const d = SD.data, last = d[d.length-1];
-  // 헤더
   document.getElementById('sName').textContent = SD.name;
   document.getElementById('sTicker').textContent = SD.ticker;
   const mEl = document.getElementById('sMarket');
   mEl.textContent = SD.market || '';
   mEl.style.cssText = SD.market === 'KOSPI'
     ? 'background:#1d4ed8;color:#fff' : 'background:#0f766e;color:#fff';
+  const ctEl = document.getElementById('sCacheTag');
+  ctEl.classList.toggle('hidden', !SD.cached);
   document.getElementById('sPrice').textContent = fN(last['종가']) + '원';
   const chg = last['등락률'] ?? 0;
   const chEl = document.getElementById('sChange');
@@ -228,12 +247,64 @@ function renderAll() {
   document.getElementById('sPeriod').textContent = d[0].date + ' ~ ' + last.date;
 
   document.getElementById('main').classList.remove('hidden');
+  document.getElementById('dlPanel').classList.add('hidden');
   renderSupplyTable();
   renderRecent10();
   renderDistChart();
   renderCumChart();
   renderPriceChart();
   renderDailyTable(1);
+}
+
+// ─── 전체 이력 다운로드 (SSE) ───
+let dlES = null;
+function startDownload() {
+  if (!SD) return;
+  const panel = document.getElementById('dlPanel');
+  const log = document.getElementById('dlLog');
+  const bar = document.getElementById('dlBar');
+  const pct = document.getElementById('dlPct');
+  const btn = document.getElementById('dlBtn');
+
+  panel.classList.remove('hidden');
+  log.innerHTML = '';
+  bar.style.width = '0%';
+  pct.textContent = '';
+  btn.disabled = true;
+  btn.style.opacity = '0.5';
+
+  if (dlES) dlES.close();
+  dlES = new EventSource(`/api/download/${SD.ticker}`);
+
+  dlES.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    const line = document.createElement('div');
+    line.textContent = d.msg;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+
+    if (d.pct !== undefined) {
+      bar.style.width = d.pct + '%';
+      pct.textContent = d.pct + '%';
+    }
+    if (d.done) {
+      dlES.close();
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.textContent = '⬇ 재다운로드';
+      // 데이터 자동 새로고침
+      setTimeout(() => loadStock(SD.ticker), 800);
+    }
+  };
+  dlES.onerror = () => {
+    const line = document.createElement('div');
+    line.textContent = '❌ 연결 끊김';
+    line.style.color = '#f87171';
+    log.appendChild(line);
+    dlES.close();
+    btn.disabled = false;
+    btn.style.opacity = '1';
+  };
 }
 
 // ① 수급분석표
