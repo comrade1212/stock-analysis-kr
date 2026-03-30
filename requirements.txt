@@ -5,5 +5,6 @@ pandas
 numpy
 pyarrow
 requests
+lxml
 setuptools
 finance-datareader

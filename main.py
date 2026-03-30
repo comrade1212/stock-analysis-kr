@@ -18,6 +18,7 @@ import re
 
 KRX_API_KEY = "8B52DF8BF23543EFBAF0AD410C0C658E44FDBADD"
 DATA_DIR = Path(__file__).parent / "data"
+import requests as _requests  # Naver 스크래핑용
 DATA_DIR.mkdir(exist_ok=True)
 
 ticker_cache: dict = {}
@@ -151,11 +152,100 @@ def fetch_ohlcv_pykrx(ticker: str, from_date: str, to_date: str) -> pd.DataFrame
 
 
 # ─────────────────────────────────────────────
-# 수급 데이터 수집
+# 수급 데이터 수집 (Naver Finance 스크래핑)
 # ─────────────────────────────────────────────
+_NAV_HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://finance.naver.com/",
+}
+
+def _parse_frgn_page(html: str) -> pd.DataFrame:
+    """frgn.nhn HTML → DataFrame (날짜, 기관, 외국인)"""
+    try:
+        tables = pd.read_html(html, flavor="lxml", encoding="utf-8")
+    except Exception:
+        return pd.DataFrame()
+    if len(tables) < 4:
+        return pd.DataFrame()
+    t = tables[3]
+    # 멀티 헤더: level(0)=기관/외국인, level(1)=순매매량
+    if t.columns.nlevels > 1:
+        # 컬럼명: (기관,순매매량) → 기관, (외국인,순매매량) → 외국인
+        new_cols = []
+        for lv0, lv1 in zip(t.columns.get_level_values(0), t.columns.get_level_values(1)):
+            if lv0 in ("기관", "외국인") and lv1 == "순매매량":
+                new_cols.append(lv0)
+            else:
+                new_cols.append(lv1)
+        t.columns = new_cols
+    else:
+        # 단일 헤더일 때 (날짜, 종가, ..., 순매매량, 순매매량, ...)
+        t.columns = t.columns.get_level_values(-1)
+
+    if "날짜" not in t.columns:
+        return pd.DataFrame()
+    t = t.dropna(subset=["날짜"])
+    t = t[t["날짜"].astype(str).str.match(r"\d{4}\.\d{2}\.\d{2}", na=False)]
+    if t.empty:
+        return pd.DataFrame()
+
+    t["date"] = pd.to_datetime(t["날짜"].str.replace(".", "-"))
+    t = t.set_index("date")
+    out = pd.DataFrame(index=t.index)
+    if "기관" in t.columns:
+        out["기관"] = pd.to_numeric(t["기관"], errors="coerce").fillna(0).astype("int64")
+    if "외국인" in t.columns:
+        out["외국인"] = pd.to_numeric(t["외국인"], errors="coerce").fillna(0).astype("int64")
+    return out
+
+
+def _frgn_total_pages(ticker: str) -> int:
+    """frgn.nhn 마지막 페이지 번호 조회"""
+    try:
+        r = _requests.get(
+            f"https://finance.naver.com/item/frgn.nhn?code={ticker}&page=1",
+            headers=_NAV_HDR, timeout=10)
+        # "맨뒤" 링크에서 직접 추출
+        m = re.search(r"href=['\"][^'\"]*page=(\d+)[^'\"]*['\"][^>]*>맨뒤", r.text)
+        if m:
+            return int(m.group(1))
+        # fallback: 모든 page= 숫자 중 최대값
+        nums = re.findall(r"page=(\d+)", r.text)
+        return max(int(n) for n in nums) if nums else 1
+    except Exception:
+        pass
+    return 1
+
+
+def fetch_investor_naver_pages(ticker: str, pages: list[int]) -> pd.DataFrame:
+    """지정 페이지 목록 병렬 수집 → 합쳐서 반환"""
+    session = _requests.Session()
+    session.headers.update(_NAV_HDR)
+
+    def get_page(p):
+        try:
+            r = session.get(
+                f"https://finance.naver.com/item/frgn.nhn?code={ticker}&page={p}",
+                timeout=12)
+            return _parse_frgn_page(r.text)
+        except Exception:
+            return pd.DataFrame()
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for df in ex.map(get_page, pages):
+            if not df.empty:
+                results.append(df)
+
+    if not results:
+        return pd.DataFrame()
+    df_all = pd.concat(results).sort_index()
+    return df_all[~df_all.index.duplicated(keep="last")]
+
+
 def fetch_investor_range(ticker: str, from_date: str, to_date: str) -> tuple[pd.DataFrame, list]:
-    """KRX 수급 데이터 (지정 기간). 상세 → 기본 순서 시도."""
-    # 1순위: 상세 (11개 투자주체)
+    """수급 데이터 수집. Naver(기관+외국인) 우선, KRX 상세 시도 병행."""
+    # 1순위: KRX 상세 시도 (서버 환경에서 작동 가능)
     try:
         df = stock.get_market_trading_value_by_date(from_date, to_date, ticker, detail=True)
         if not df.empty:
@@ -168,7 +258,6 @@ def fetch_investor_range(ticker: str, from_date: str, to_date: str) -> tuple[pd.
             return df[cols], cols
     except Exception:
         pass
-    # 2순위: 기본 (기관합계/개인/외국인합계/기타법인)
     try:
         df = stock.get_market_trading_value_by_date(from_date, to_date, ticker)
         if not df.empty:
@@ -176,6 +265,21 @@ def fetch_investor_range(ticker: str, from_date: str, to_date: str) -> tuple[pd.
             return df[cols], cols
     except Exception:
         pass
+
+    # 2순위: Naver 스크래핑 (기관 + 외국인, 항상 동작)
+    try:
+        # 날짜 필터 대신 page=1 (최근 20일) - 증분 업데이트용
+        df = fetch_investor_naver_pages(ticker, [1, 2])
+        if not df.empty:
+            # 날짜 범위 필터
+            fd = pd.to_datetime(from_date)
+            td = pd.to_datetime(to_date)
+            df = df[(df.index >= fd) & (df.index <= td)]
+            cols = [c for c in df.columns if c in ("기관", "외국인")]
+            return df[cols], cols
+    except Exception:
+        pass
+
     return pd.DataFrame(), []
 
 
@@ -206,39 +310,34 @@ def do_full_download(ticker: str):
         yield _sse(f"❌ OHLCV 오류: {e}", done=True)
         return
 
-    # ── 2. 수급 (pykrx, 730일 청크)
-    yield _sse("📥 수급 데이터 전체 다운로드 중 (KRX, 청크별)...", 35)
-    start_dt = df_price.index[0]
-    end_dt = datetime.strptime(today, "%Y%m%d")
-    total_days = (end_dt - start_dt).days
-    chunks = []
-    cur = start_dt
-    while cur <= end_dt:
-        nxt = min(cur + timedelta(days=729), end_dt)
-        chunks.append((cur.strftime("%Y%m%d"), nxt.strftime("%Y%m%d")))
-        cur = nxt + timedelta(days=1)
+    # ── 2. 수급 (Naver frgn 전체 페이지 스크래핑)
+    yield _sse("📥 수급 데이터 다운로드 중 (Naver, 기관·외국인)...", 35)
+    try:
+        total_pages = _frgn_total_pages(ticker)
+        yield _sse(f"  총 {total_pages}페이지 병렬 수집 시작...", 38)
 
-    all_inv = []
-    inv_cols = []
-    for i, (s, e) in enumerate(chunks):
-        pct = 35 + int((i / len(chunks)) * 60)
-        yield _sse(f"  수급 {i+1}/{len(chunks)} 청크 ({s[:4]}~{e[:4]}) 수신 중...", pct)
-        try:
-            df_chunk, cols = fetch_investor_range(ticker, s, e)
-            if not df_chunk.empty:
-                all_inv.append(df_chunk)
-                if not inv_cols:
-                    inv_cols = cols
-        except Exception as ex:
-            yield _sse(f"  ⚠️ 청크 {i+1} 오류: {ex}")
+        all_inv = []
+        BATCH = 20  # 한 번에 20페이지씩
+        page_batches = [list(range(i, min(i + BATCH, total_pages + 1)))
+                        for i in range(1, total_pages + 1, BATCH)]
 
-    if all_inv:
-        df_inv = pd.concat(all_inv).sort_index()
-        df_inv = df_inv[~df_inv.index.duplicated(keep="last")]
-        save_inv(ticker, df_inv)
-        yield _sse(f"✅ 수급 {len(df_inv):,}행 저장 완료 ({len(inv_cols)}개 투자주체)", 95)
-    else:
-        yield _sse("⚠️ 수급 데이터 없음 (KRX 접근 불가 - 서버 환경에서 재시도)", 95)
+        for bi, batch in enumerate(page_batches):
+            pct = 38 + int((bi / len(page_batches)) * 55)
+            yield _sse(f"  페이지 {batch[0]}~{batch[-1]} / {total_pages} 수집 중...", pct)
+            df_batch = fetch_investor_naver_pages(ticker, batch)
+            if not df_batch.empty:
+                all_inv.append(df_batch)
+
+        if all_inv:
+            df_inv = pd.concat(all_inv).sort_index()
+            df_inv = df_inv[~df_inv.index.duplicated(keep="last")]
+            save_inv(ticker, df_inv)
+            inv_cols = list(df_inv.columns)
+            yield _sse(f"✅ 수급 {len(df_inv):,}행 저장 완료 ({', '.join(inv_cols)})", 95)
+        else:
+            yield _sse("⚠️ 수급 데이터를 가져오지 못했습니다.", 95)
+    except Exception as e:
+        yield _sse(f"⚠️ 수급 오류: {e}", 95)
 
     yield _sse("🎉 전체 다운로드 완료!", 100, done=True)
 
