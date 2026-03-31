@@ -7,3 +7,25 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: UPDATE_SECRET
+        generateValue: true   # Render가 자동 생성 (대시보드에서 확인)
+    disk:
+      name: stock-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+
+  - type: cron
+    name: stock-update-cron
+    runtime: python
+    buildCommand: pip install requests
+    # 매일 오후 6시 30분 KST (= 09:30 UTC)
+    schedule: "30 9 * * 1-5"
+    command: python cron_trigger.py
+    envVars:
+      - key: SERVICE_URL
+        value: https://stock-analysis-kr.onrender.com   # Render 대시보드에서 실제 URL 확인 후 수정
+      - key: UPDATE_SECRET
+        fromService:
+          name: stock-analysis
+          type: web
+          envVarKey: UPDATE_SECRET

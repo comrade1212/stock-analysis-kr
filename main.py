@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,8 +15,12 @@ import urllib.request
 import urllib.parse
 import json
 import re
+import os
+import math
+import time
 
 KRX_API_KEY = "8B52DF8BF23543EFBAF0AD410C0C658E44FDBADD"
+UPDATE_SECRET = os.environ.get("UPDATE_SECRET", "")
 DATA_DIR = Path(__file__).parent / "data"
 import requests as _requests  # Naver 스크래핑용
 DATA_DIR.mkdir(exist_ok=True)
@@ -343,6 +347,157 @@ def do_full_download(ticker: str):
 
 
 # ─────────────────────────────────────────────
+# 서버 수급 업데이트 (pykrx 13컬럼, 컬럼 업그레이드)
+# ─────────────────────────────────────────────
+def _upgrade_inv_columns(df_inv: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    """기존 inv parquet를 pykrx 13컬럼 체계로 업그레이드.
+    Naver의 '기관' → '기관계' rename, 없는 컬럼은 0으로 채움.
+    """
+    df_inv = df_inv.copy()
+    if "기관" in df_inv.columns and "기관계" not in df_inv.columns:
+        df_inv = df_inv.rename(columns={"기관": "기관계"})
+    for col in new_df.columns:
+        if col not in df_inv.columns:
+            df_inv[col] = 0
+    return df_inv
+
+
+def _estimate_pages_for_dates(missing_dates: list, today_dt: pd.Timestamp) -> list[int]:
+    """Naver frgn 페이지 번호 계산 (20행/페이지, 오늘 기준 역순)"""
+    if not missing_dates:
+        return []
+    pages = set()
+    for dt in missing_dates:
+        bdays = len(pd.bdate_range(dt, today_dt))
+        page = max(1, math.ceil(bdays / 20))
+        pages.update([max(1, page - 1), page, page + 1])
+    return sorted(pages)
+
+
+def _server_fetch_inv(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
+    """서버 전용: pykrx 13컬럼 시도 → Naver 폴백 (기관계+외국인)"""
+    # 1순위: pykrx detail
+    try:
+        df = stock.get_market_trading_value_by_date(from_date, to_date, ticker, detail=True)
+        if df is not None and not df.empty:
+            inst_present = [c for c in INSTITUTION_COLS if c in df.columns]
+            if inst_present and "기관계" not in df.columns:
+                df["기관계"] = df[inst_present].sum(axis=1)
+            cols = [c for c in INV_ORDER if c in df.columns]
+            return df[cols]
+    except Exception:
+        pass
+    # 2순위: pykrx 기본
+    try:
+        df = stock.get_market_trading_value_by_date(from_date, to_date, ticker)
+        if df is not None and not df.empty:
+            return df[[c for c in df.columns if c != "전체"]]
+    except Exception:
+        pass
+    # 3순위: Naver frgn
+    try:
+        today_dt = pd.Timestamp(datetime.now().date())
+        missing_approx = list(pd.bdate_range(from_date, to_date))
+        pages = _estimate_pages_for_dates(missing_approx, today_dt)
+        pages = pages[:10]  # 최대 10페이지
+        naver_df = fetch_investor_naver_pages(ticker, pages)
+        if not naver_df.empty:
+            fd, td = pd.Timestamp(from_date), pd.Timestamp(to_date)
+            return naver_df[(naver_df.index >= fd) & (naver_df.index <= td)]
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def server_update_ticker(ticker: str) -> tuple[str, int]:
+    """서버에서 한 종목 수급 업데이트. (메시지, 추가된 행 수) 반환"""
+    inv_file = inv_path(ticker)
+    price_file = price_path(ticker)
+    if not inv_file.exists() or not price_file.exists():
+        return f"[{ticker}] 파일 없음", 0
+
+    df_inv = load_inv(ticker)
+    df_pr = load_price(ticker)
+    if df_inv.empty or df_pr.empty:
+        return f"[{ticker}] 데이터 없음", 0
+
+    df_inv.index = pd.to_datetime(df_inv.index).normalize()
+    df_pr.index = pd.to_datetime(df_pr.index).normalize()
+
+    today_dt = pd.Timestamp(datetime.now().date())
+    inv_start = df_inv.index.min()
+    inv_end = df_inv.index.max()
+
+    # 거래일 후보: price 기준 + inv 마지막 이후 영업일 추정
+    trading = df_pr.index[(df_pr.index >= inv_start) & (df_pr.index <= today_dt)]
+    if inv_end < today_dt - timedelta(days=1):
+        estimated = pd.DatetimeIndex(
+            pd.bdate_range(inv_end + timedelta(days=1), today_dt)
+        ).normalize()
+        trading = pd.DatetimeIndex(sorted(set(trading) | set(estimated)))
+
+    missing = sorted(set(trading) - set(df_inv.index.normalize()))
+    if not missing:
+        return f"[{ticker}] 최신 상태", 0
+
+    from_str = missing[0].strftime("%Y%m%d")
+    to_str = missing[-1].strftime("%Y%m%d")
+
+    new_df = _server_fetch_inv(ticker, from_str, to_str)
+    if new_df.empty:
+        return f"[{ticker}] 수집 실패 ({len(missing)}일 누락)", 0
+
+    new_df.index = pd.to_datetime(new_df.index).normalize()
+    new_df = new_df[new_df.index.isin(missing)]
+    if new_df.empty:
+        return f"[{ticker}] 해당 기간 거래 없음", 0
+
+    # 컬럼 업그레이드 (Naver 2컬럼 → pykrx 13컬럼)
+    df_inv = _upgrade_inv_columns(df_inv, new_df)
+    # 새 데이터도 기존 컬럼에 맞춤 (누락 컬럼 0으로)
+    for col in df_inv.columns:
+        if col not in new_df.columns:
+            new_df = new_df.copy()
+            new_df[col] = 0
+    new_df = new_df[df_inv.columns]
+
+    df_updated = pd.concat([df_inv, new_df])
+    df_updated = df_updated[~df_updated.index.duplicated(keep="last")].sort_index()
+    save_inv(ticker, df_updated)
+
+    return f"[{ticker}] {len(new_df)}일 추가 (총 {len(df_updated)}행)", len(new_df)
+
+
+def do_server_update_all(tickers: list[str] | None = None):
+    """SSE 제너레이터: 모든 종목(또는 지정 종목) 서버 업데이트"""
+    if tickers is None:
+        tickers = sorted(
+            p.stem.replace("_inv", "")
+            for p in DATA_DIR.glob("*_inv.parquet")
+        )
+    if not tickers:
+        yield _sse("업데이트할 종목 없음", done=True)
+        return
+
+    total = len(tickers)
+    yield _sse(f"서버 수급 업데이트 시작: {total}개 종목", 0)
+
+    added_total = 0
+    for i, ticker in enumerate(tickers):
+        pct = int((i / total) * 100)
+        try:
+            msg, added = server_update_ticker(ticker)
+            added_total += added
+            yield _sse(msg, pct)
+        except Exception as e:
+            yield _sse(f"[{ticker}] 오류: {e}", pct)
+        await_sleep = 0  # sync context, no await
+        time.sleep(0.2)
+
+    yield _sse(f"완료: {total}개 종목, {added_total}일 추가", 100, done=True)
+
+
+# ─────────────────────────────────────────────
 # 수급 분석 계산
 # ─────────────────────────────────────────────
 def calc_supply_analysis(df: pd.DataFrame, inv_cols: list):
@@ -428,6 +583,31 @@ def search(q: str = Query(..., min_length=1)):
         return krx_search_by_code(q)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/update-all")
+async def admin_update_all(
+    tickers: str = Query(None, description="쉼표 구분 종목코드. 없으면 전체"),
+    x_update_secret: str | None = Header(None),
+):
+    """서버에서 pykrx 13컬럼으로 수급 업데이트 (SSE 스트리밍).
+    X-Update-Secret 헤더 또는 UPDATE_SECRET 환경변수로 인증.
+    """
+    if UPDATE_SECRET and x_update_secret != UPDATE_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    ticker_list = [t.strip() for t in tickers.split(",")] if tickers else None
+
+    async def async_generate():
+        for msg in do_server_update_all(ticker_list):
+            yield msg
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        async_generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/download/status/{ticker}")
