@@ -7,4 +7,3 @@ pyarrow
 requests
 lxml
 setuptools
-finance-datareader

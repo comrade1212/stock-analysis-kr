@@ -15,6 +15,7 @@ update_db.py  — 수급 DB 일괄 업데이트
 """
 
 import sys
+import os
 import time
 import re
 import math
@@ -25,7 +26,8 @@ import pandas as pd
 import requests
 from pykrx import stock as pykrx_stock
 
-DATA_DIR = Path(__file__).parent / "data"
+# main.py와 동일 규칙: DATA_DIR 환경변수가 있으면 그 경로(영구 볼륨)를 쓴다.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or Path(__file__).parent / "data")
 TODAY = datetime.now().strftime("%Y%m%d")
 TODAY_DT = pd.Timestamp(TODAY)
 

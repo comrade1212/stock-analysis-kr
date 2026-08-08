@@ -19,11 +19,12 @@ import os
 import math
 import time
 
-KRX_API_KEY = "8B52DF8BF23543EFBAF0AD410C0C658E44FDBADD"
 UPDATE_SECRET = os.environ.get("UPDATE_SECRET", "")
-DATA_DIR = Path(__file__).parent / "data"
+# DATA_DIR: 배포 환경에서는 영구 볼륨 경로를 DATA_DIR 환경변수로 주입한다.
+# (Railway Volume 마운트 경로 예: /app/data). 미설정 시 로컬 data/ 폴더.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or Path(__file__).parent / "data")
 import requests as _requests  # Naver 스크래핑용
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ticker_cache: dict = {}
 cache_ready = False
