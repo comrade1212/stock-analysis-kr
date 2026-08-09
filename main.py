@@ -7,10 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pykrx import stock
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from io import StringIO
 import asyncio
 import concurrent.futures
 import threading
+import queue
 import urllib.request
 import urllib.parse
 import json
@@ -34,6 +36,44 @@ KRX_SEARCH_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 INSTITUTION_COLS = ["금융투자", "보험", "투신", "사모", "은행", "기타금융", "연기금등"]
 # detail=True 컬럼 순서
 INV_ORDER = ["개인", "외국인", "기관계"] + INSTITUTION_COLS + ["기타법인", "기타외국인"]
+
+# 서버(Railway 등)는 UTC로 돌므로 날짜 계산은 반드시 KST 기준으로 한다.
+KST = timezone(timedelta(hours=9))
+
+def now_kst() -> datetime:
+    return datetime.now(KST)
+
+def today_kst_str() -> str:
+    return now_kst().strftime("%Y%m%d")
+
+
+# ─────────────────────────────────────────────
+# KRX(pykrx) 호출 보호
+# KRX는 해외 데이터센터 IP를 차단하는 경우가 많아, pykrx 호출이 응답 없이
+# 매달리면 이벤트 루프/스레드가 잠기고 Railway CPU 과금만 쌓인다.
+# 타임아웃을 강제하고, 연속 실패 시 1시간 동안 KRX 호출을 건너뛴다.
+# ─────────────────────────────────────────────
+krx_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+_krx_state = {"fails": 0, "disabled_until": 0.0}
+_KRX_FAIL_LIMIT = 3
+_KRX_COOLDOWN_SEC = 3600
+
+def krx_call(fn, timeout_sec: float = 8.0):
+    """pykrx 호출을 타임아웃과 함께 실행. 실패/타임아웃 시 None 반환."""
+    if time.time() < _krx_state["disabled_until"]:
+        return None
+    fut = krx_pool.submit(fn)
+    try:
+        result = fut.result(timeout=timeout_sec)
+        _krx_state["fails"] = 0
+        return result
+    except Exception:
+        fut.cancel()
+        _krx_state["fails"] += 1
+        if _krx_state["fails"] >= _KRX_FAIL_LIMIT:
+            _krx_state["disabled_until"] = time.time() + _KRX_COOLDOWN_SEC
+            print(f"[KRX] 연속 {_krx_state['fails']}회 실패 → {_KRX_COOLDOWN_SEC // 60}분간 KRX 호출 생략 (Naver 폴백 사용)")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -79,7 +119,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="한국 주식 수급분석", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+# CPU 스파이크(=Railway 과금)를 줄이기 위해 워커 수를 보수적으로 유지
+pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
 # ─────────────────────────────────────────────
@@ -117,7 +158,7 @@ def last_date(df: pd.DataFrame) -> str | None:
 # ─────────────────────────────────────────────
 def fetch_ohlcv_full_naver(ticker: str) -> pd.DataFrame:
     """Naver siseJson: 상장일~현재 전체 이력 (한 번에 수신, 가장 빠름)"""
-    today = datetime.now().strftime("%Y%m%d")
+    today = today_kst_str()
     url = (
         f"https://fchart.stock.naver.com/siseJson.nhn"
         f"?symbol={ticker}&requestType=1"
@@ -167,7 +208,8 @@ _NAV_HDR = {
 def _parse_frgn_page(html: str) -> pd.DataFrame:
     """frgn.nhn HTML → DataFrame (날짜, 기관, 외국인)"""
     try:
-        tables = pd.read_html(html, flavor="lxml", encoding="utf-8")
+        # pandas 2.1+ 는 문자열 직접 전달을 지원하지 않으므로 StringIO로 감싼다
+        tables = pd.read_html(StringIO(html), flavor="lxml")
     except Exception:
         return pd.DataFrame()
     if len(tables) < 4:
@@ -237,7 +279,7 @@ def fetch_investor_naver_pages(ticker: str, pages: list[int]) -> pd.DataFrame:
             return pd.DataFrame()
 
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         for df in ex.map(get_page, pages):
             if not df.empty:
                 results.append(df)
@@ -249,27 +291,23 @@ def fetch_investor_naver_pages(ticker: str, pages: list[int]) -> pd.DataFrame:
 
 
 def fetch_investor_range(ticker: str, from_date: str, to_date: str) -> tuple[pd.DataFrame, list]:
-    """수급 데이터 수집. Naver(기관+외국인) 우선, KRX 상세 시도 병행."""
-    # 1순위: KRX 상세 시도 (서버 환경에서 작동 가능)
-    try:
-        df = stock.get_market_trading_value_by_date(from_date, to_date, ticker, detail=True)
-        if not df.empty:
-            inst_present = [c for c in INSTITUTION_COLS if c in df.columns]
-            if inst_present and "기관계" not in df.columns:
-                df["기관계"] = df[inst_present].sum(axis=1)
-            cols = [c for c in INV_ORDER if c in df.columns]
-            extra = [c for c in df.columns if c not in cols and c != "전체"]
-            cols += extra
-            return df[cols], cols
-    except Exception:
-        pass
-    try:
-        df = stock.get_market_trading_value_by_date(from_date, to_date, ticker)
-        if not df.empty:
-            cols = [c for c in df.columns if c != "전체"]
-            return df[cols], cols
-    except Exception:
-        pass
+    """수급 데이터 수집. KRX 상세(타임아웃 보호) 우선, Naver 폴백."""
+    # 1순위: KRX 상세 시도 (타임아웃 보호 - KRX가 응답 안 하면 즉시 폴백)
+    df = krx_call(lambda: stock.get_market_trading_value_by_date(
+        from_date, to_date, ticker, detail=True), timeout_sec=8)
+    if df is not None and not df.empty:
+        inst_present = [c for c in INSTITUTION_COLS if c in df.columns]
+        if inst_present and "기관계" not in df.columns:
+            df["기관계"] = df[inst_present].sum(axis=1)
+        cols = [c for c in INV_ORDER if c in df.columns]
+        extra = [c for c in df.columns if c not in cols and c != "전체"]
+        cols += extra
+        return df[cols], cols
+    df = krx_call(lambda: stock.get_market_trading_value_by_date(
+        from_date, to_date, ticker), timeout_sec=8)
+    if df is not None and not df.empty:
+        cols = [c for c in df.columns if c != "전체"]
+        return df[cols], cols
 
     # 2순위: Naver 스크래핑 (기관 + 외국인, 항상 동작)
     try:
@@ -300,7 +338,7 @@ def _sse(msg: str, pct: int = -1, done: bool = False) -> str:
 
 def do_full_download(ticker: str):
     """제너레이터: SSE 메시지를 yield 하며 전체 이력 다운로드"""
-    today = datetime.now().strftime("%Y%m%d")
+    today = today_kst_str()
 
     # ── 1. OHLCV (Naver siseJson, 한 번에)
     yield _sse("📥 OHLCV 전체 이력 다운로드 중...", 5)
@@ -376,28 +414,24 @@ def _estimate_pages_for_dates(missing_dates: list, today_dt: pd.Timestamp) -> li
 
 
 def _server_fetch_inv(ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
-    """서버 전용: pykrx 13컬럼 시도 → Naver 폴백 (기관계+외국인)"""
+    """서버 전용: pykrx 13컬럼 시도(타임아웃 보호) → Naver 폴백 (기관계+외국인)"""
     # 1순위: pykrx detail
-    try:
-        df = stock.get_market_trading_value_by_date(from_date, to_date, ticker, detail=True)
-        if df is not None and not df.empty:
-            inst_present = [c for c in INSTITUTION_COLS if c in df.columns]
-            if inst_present and "기관계" not in df.columns:
-                df["기관계"] = df[inst_present].sum(axis=1)
-            cols = [c for c in INV_ORDER if c in df.columns]
-            return df[cols]
-    except Exception:
-        pass
+    df = krx_call(lambda: stock.get_market_trading_value_by_date(
+        from_date, to_date, ticker, detail=True), timeout_sec=8)
+    if df is not None and not df.empty:
+        inst_present = [c for c in INSTITUTION_COLS if c in df.columns]
+        if inst_present and "기관계" not in df.columns:
+            df["기관계"] = df[inst_present].sum(axis=1)
+        cols = [c for c in INV_ORDER if c in df.columns]
+        return df[cols]
     # 2순위: pykrx 기본
-    try:
-        df = stock.get_market_trading_value_by_date(from_date, to_date, ticker)
-        if df is not None and not df.empty:
-            return df[[c for c in df.columns if c != "전체"]]
-    except Exception:
-        pass
+    df = krx_call(lambda: stock.get_market_trading_value_by_date(
+        from_date, to_date, ticker), timeout_sec=8)
+    if df is not None and not df.empty:
+        return df[[c for c in df.columns if c != "전체"]]
     # 3순위: Naver frgn
     try:
-        today_dt = pd.Timestamp(datetime.now().date())
+        today_dt = pd.Timestamp(now_kst().date())
         missing_approx = list(pd.bdate_range(from_date, to_date))
         pages = _estimate_pages_for_dates(missing_approx, today_dt)
         pages = pages[:10]  # 최대 10페이지
@@ -425,7 +459,7 @@ def server_update_ticker(ticker: str) -> tuple[str, int]:
     df_inv.index = pd.to_datetime(df_inv.index).normalize()
     df_pr.index = pd.to_datetime(df_pr.index).normalize()
 
-    today_dt = pd.Timestamp(datetime.now().date())
+    today_dt = pd.Timestamp(now_kst().date())
     inv_start = df_inv.index.min()
     inv_end = df_inv.index.max()
 
@@ -492,7 +526,6 @@ def do_server_update_all(tickers: list[str] | None = None):
             yield _sse(msg, pct)
         except Exception as e:
             yield _sse(f"[{ticker}] 오류: {e}", pct)
-        await_sleep = 0  # sync context, no await
         time.sleep(0.2)
 
     yield _sse(f"완료: {total}개 종목, {added_total}일 추가", 100, done=True)
@@ -586,29 +619,93 @@ def search(q: str = Query(..., min_length=1)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# 업데이트 진행 상태 (중복 실행 방지 + 상태 조회용)
+_update_state = {"running": False, "started_at": None, "finished_at": None, "last_message": None}
+_update_lock = threading.Lock()
+
+
+def _run_update_thread(ticker_list, q: queue.Queue):
+    """백그라운드 스레드에서 전체 업데이트 실행.
+    클라이언트(cron)가 연결을 끊어도 업데이트는 끝까지 진행된다."""
+    try:
+        for msg in do_server_update_all(ticker_list):
+            _update_state["last_message"] = msg
+            q.put(msg)
+    except Exception as e:
+        q.put(_sse(f"업데이트 스레드 오류: {e}", done=True))
+    finally:
+        _update_state["running"] = False
+        _update_state["finished_at"] = now_kst().isoformat()
+        q.put(None)
+
+
 @app.get("/api/admin/update-all")
 async def admin_update_all(
     tickers: str = Query(None, description="쉼표 구분 종목코드. 없으면 전체"),
     x_update_secret: str | None = Header(None),
 ):
-    """서버에서 pykrx 13컬럼으로 수급 업데이트 (SSE 스트리밍).
-    X-Update-Secret 헤더 또는 UPDATE_SECRET 환경변수로 인증.
+    """서버에서 수급 업데이트 (SSE 스트리밍, 백그라운드 실행).
+    X-Update-Secret 헤더가 UPDATE_SECRET 환경변수와 일치해야 한다.
     """
-    if UPDATE_SECRET and x_update_secret != UPDATE_SECRET:
+    if not UPDATE_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="UPDATE_SECRET 환경변수가 설정되지 않았습니다. Railway 대시보드에서 설정하세요.")
+    if x_update_secret != UPDATE_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    with _update_lock:
+        if _update_state["running"]:
+            raise HTTPException(status_code=409, detail="이미 업데이트가 진행 중입니다")
+        _update_state["running"] = True
+        _update_state["started_at"] = now_kst().isoformat()
+        _update_state["finished_at"] = None
+
     ticker_list = [t.strip() for t in tickers.split(",")] if tickers else None
+    q: queue.Queue = queue.Queue()
+    threading.Thread(target=_run_update_thread, args=(ticker_list, q), daemon=True).start()
 
     async def async_generate():
-        for msg in do_server_update_all(ticker_list):
+        loop = asyncio.get_event_loop()
+        while True:
+            msg = await loop.run_in_executor(None, q.get)
+            if msg is None:
+                break
             yield msg
-            await asyncio.sleep(0)
 
     return StreamingResponse(
         async_generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/admin/status")
+def admin_status(x_update_secret: str | None = Header(None)):
+    """데이터 디렉터리/업데이트 상태 점검용 (볼륨 마운트·데이터 최신성 확인)"""
+    if UPDATE_SECRET and x_update_secret != UPDATE_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    inv_files = sorted(DATA_DIR.glob("*_inv.parquet"))
+    price_files = sorted(DATA_DIR.glob("*_price.parquet"))
+    samples = {}
+    for p in inv_files[:20]:
+        try:
+            idx = pd.read_parquet(p, columns=[]).index
+            samples[p.stem.replace("_inv", "")] = str(pd.to_datetime(idx).max().date()) if len(idx) else None
+        except Exception as e:
+            samples[p.stem.replace("_inv", "")] = f"오류: {e}"
+    return {
+        "data_dir": str(DATA_DIR),
+        "data_dir_env": os.environ.get("DATA_DIR"),
+        "inv_files": len(inv_files),
+        "price_files": len(price_files),
+        "update_secret_set": bool(UPDATE_SECRET),
+        "update_state": _update_state,
+        "krx_disabled": time.time() < _krx_state["disabled_until"],
+        "server_time_kst": now_kst().isoformat(),
+        "inv_last_dates_sample": samples,
+    }
 
 
 @app.get("/api/download/status/{ticker}")
@@ -630,16 +727,16 @@ def download_status(ticker: str):
 @app.get("/api/download/{ticker}")
 async def download_stock(ticker: str):
     """SSE 스트리밍으로 전체 이력 다운로드"""
-    def generate():
-        for msg in do_full_download(ticker):
-            yield msg
-
     loop = asyncio.get_event_loop()
 
     async def async_generate():
-        for msg in do_full_download(ticker):
+        gen = do_full_download(ticker)
+        while True:
+            # 동기 제너레이터를 스레드에서 돌려 이벤트 루프 블로킹 방지
+            msg = await loop.run_in_executor(pool, lambda: next(gen, None))
+            if msg is None:
+                break
             yield msg
-            await asyncio.sleep(0)
 
     return StreamingResponse(async_generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -647,23 +744,25 @@ async def download_stock(ticker: str):
 
 @app.get("/api/stock/{ticker}")
 async def get_stock(ticker: str):
-    today = datetime.now().strftime("%Y%m%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    today = today_kst_str()
 
     def fetch():
-        # 종목명
-        try:
-            name = stock.get_market_ticker_name(ticker) or ticker
-        except Exception:
-            name = ticker_cache.get(ticker, {}).get("name", ticker)
+        # 종목명: 캐시 우선 (pykrx 호출은 KRX 차단 시 매달릴 수 있음)
+        name = ticker_cache.get(ticker, {}).get("name")
+        if not name:
+            name = krx_call(lambda: stock.get_market_ticker_name(ticker), timeout_sec=5) or ticker
 
         # ── OHLCV 로드/업데이트
         df_price = load_price(ticker)
         if df_price.empty:
-            # 캐시 없음: 실시간 pykrx (최근 12년)
-            df_price = fetch_ohlcv_pykrx(ticker, "19900101", today)
+            # 캐시 없음: Naver 전체 이력 (요청 1번, KRX 차단과 무관하게 동작)
+            df_price = fetch_ohlcv_full_naver(ticker)
+            if df_price is None or df_price.empty:
+                df_price = krx_call(
+                    lambda: fetch_ohlcv_pykrx(ticker, "19900101", today), timeout_sec=15)
             if df_price is None or df_price.empty:
                 raise ValueError(f"종목 데이터 없음: {ticker}")
+            save_price(ticker, df_price)
             cached = False
         else:
             cached = True
@@ -671,8 +770,14 @@ async def get_stock(ticker: str):
             # 마지막 날짜 이후 증분 업데이트
             if ld and ld < today:
                 next_day = (datetime.strptime(ld, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
-                new_p = fetch_ohlcv_pykrx(ticker, next_day, today)
-                if not new_p.empty:
+                new_p = krx_call(
+                    lambda: fetch_ohlcv_pykrx(ticker, next_day, today), timeout_sec=10)
+                if new_p is None or new_p.empty:
+                    # KRX 실패 시 Naver 전체 이력으로 대체 (한 번의 요청으로 최신까지 확보)
+                    naver_full = fetch_ohlcv_full_naver(ticker)
+                    if not naver_full.empty:
+                        new_p = naver_full[naver_full.index > df_price.index.max()]
+                if new_p is not None and not new_p.empty:
                     df_price = pd.concat([df_price, new_p])
                     df_price = df_price[~df_price.index.duplicated(keep="last")].sort_index()
                     save_price(ticker, df_price)
@@ -681,8 +786,8 @@ async def get_stock(ticker: str):
         df_inv = load_inv(ticker)
         inv_cols = list(df_inv.columns) if not df_inv.empty else []
         if df_inv.empty:
-            # 캐시 없음: 실시간 pykrx (최근 1년만)
-            one_year_ago = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+            # 캐시 없음: 실시간 (최근 1년만)
+            one_year_ago = (now_kst() - timedelta(days=365)).strftime("%Y%m%d")
             df_inv, inv_cols = fetch_investor_range(ticker, one_year_ago, today)
         else:
             ld = last_date(df_inv)
